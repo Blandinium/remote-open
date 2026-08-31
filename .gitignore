@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+build/
+dist/
+.venv/
+venv/
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# Vim
+*.swp
+*.swo
+*.swn
+Session.vim
+
+# PyCharm and IntelliJ
+.idea/
+
+# Visual Studio Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

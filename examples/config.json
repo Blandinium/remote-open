@@ -1,0 +1,11 @@
+{
+  "targets": {
+    "REMOTE_ALIAS": {
+      "url_prefix": "sftp://REMOTE_USER@REMOTE_HOST"
+    }
+  },
+  "commands": {
+    "edit": ["kate"],
+    "diff": ["kompare", "-c"]
+  }
+}
