@@ -30,7 +30,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(remote_open.read_message(stream), message)
 
     def test_request_operation_is_an_enum(self):
-        operation, _, _ = remote_open.validate_request(
+        operation, _, _, _ = remote_open.validate_request(
             {"operation": "edit", "target": "one", "paths": ["/tmp/file"]}
         )
         self.assertIs(operation, remote_open.Operation.EDIT)
@@ -44,6 +44,12 @@ class ProtocolTests(unittest.TestCase):
     def test_diff_needs_two_paths(self):
         with self.assertRaises(remote_open.RemoteOpenError):
             remote_open.validate_request({"operation": "diff", "target": "one", "paths": ["/tmp/a"]})
+
+    def test_open_needs_one_path(self):
+        with self.assertRaises(remote_open.RemoteOpenError):
+            remote_open.validate_request(
+                {"operation": "open", "target": "one", "paths": ["/tmp/a", "/tmp/b"]}
+            )
 
     def test_url_quotes_special_characters(self):
         urls = remote_open.remote_urls("sftp://user@host/", ["/tmp/a b#c"])
@@ -62,7 +68,11 @@ class ProtocolTests(unittest.TestCase):
                 "one": {"url_prefix": "sftp://user@host"},
                 "two": {"url_prefix": "sftp://user@other"},
             },
-            "commands": {"edit": ["kate"], "diff": ["kompare", "-c"]},
+            "commands": {
+                "open": ["kioclient", "exec", "{url}", "{mime_type}"],
+                "edit": ["kate"],
+                "diff": ["kompare", "-c"],
+            },
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
@@ -75,7 +85,11 @@ class ProtocolTests(unittest.TestCase):
                 "one": {"url_prefix": "sftp://user@one"},
                 "two": {"url_prefix": "sftp://user@two"},
             },
-            "commands": {"edit": ["kate"], "diff": ["kompare", "-c"]},
+            "commands": {
+                "open": ["kioclient", "exec", "{url}", "{mime_type}"],
+                "edit": ["kate"],
+                "diff": ["kompare", "-c"],
+            },
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
@@ -91,6 +105,45 @@ class ProtocolTests(unittest.TestCase):
                 start_new_session=True,
             )
 
+    def test_open_substitutes_url_and_mime_type(self):
+        value = {
+            "targets": {"one": {"url_prefix": "sftp://user@host"}},
+            "commands": {
+                "open": ["kioclient", "exec", "{url}", "{mime_type}"],
+                "edit": ["kate"],
+                "diff": ["kompare"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with mock.patch.object(remote_open.subprocess, "Popen") as popen:
+                popen.return_value.wait.return_value = 0
+                remote_open.launch(
+                    path,
+                    {
+                        "operation": "open",
+                        "target": "one",
+                        "paths": ["/tmp/a b.pdf"],
+                        "mime_type": "application/pdf",
+                    },
+                )
+            popen.assert_called_once_with(
+                ["kioclient", "exec", "sftp://user@host/tmp/a%20b.pdf", "application/pdf"],
+                start_new_session=True,
+            )
+
+    def test_detects_mime_type_with_file(self):
+        result = subprocess.CompletedProcess([], 0, "image/png\n", "")
+        with mock.patch.object(remote_open.subprocess, "run", return_value=result) as run:
+            self.assertEqual(remote_open.detect_mime_type("/tmp/image"), "image/png")
+        run.assert_called_once_with(
+            ["file", "--brief", "--mime-type", "--", "/tmp/image"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def test_bridge_exchange(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -100,7 +153,11 @@ class ProtocolTests(unittest.TestCase):
                 json.dumps(
                     {
                         "targets": {"one": {"url_prefix": "sftp://user@host"}},
-                        "commands": {"edit": ["/bin/true"], "diff": ["/bin/true"]},
+                        "commands": {
+                            "open": ["/bin/true", "{url}"],
+                            "edit": ["/bin/true"],
+                            "diff": ["/bin/true"],
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -167,7 +224,11 @@ class ProtocolTests(unittest.TestCase):
                 json.dumps(
                     {
                         "targets": {"known": {"url_prefix": "sftp://user@host"}},
-                        "commands": {"edit": ["/bin/true"], "diff": ["/bin/true"]},
+                        "commands": {
+                            "open": ["/bin/true", "{url}"],
+                            "edit": ["/bin/true"],
+                            "diff": ["/bin/true"],
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -191,6 +252,49 @@ class ProtocolTests(unittest.TestCase):
                 )
         client.settimeout.assert_called_once_with(remote_open.SOCKET_TIMEOUT)
         client.close.assert_called_once_with()
+
+    def test_main_sends_one_open_request_per_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.png"
+            second = Path(directory) / "second.pdf"
+            first.touch()
+            second.touch()
+            arguments = mock.Mock(operation="open", paths=[str(first), str(second)])
+            with mock.patch.object(remote_open, "parser") as parser:
+                parser.return_value.parse_args.return_value = arguments
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "REMOTE_OPEN_SOCKET": "/tmp/bridge.sock",
+                        "REMOTE_OPEN_TARGET": "one",
+                    },
+                ):
+                    with mock.patch.object(
+                        remote_open,
+                        "detect_mime_type",
+                        side_effect=["image/png", "application/pdf"],
+                    ):
+                        with mock.patch.object(remote_open, "send_request", return_value=0) as send:
+                            self.assertEqual(remote_open.main(), 0)
+        self.assertEqual(
+            send.call_args_list,
+            [
+                mock.call(
+                    Path("/tmp/bridge.sock"),
+                    "one",
+                    remote_open.Operation.OPEN,
+                    [str(first)],
+                    "image/png",
+                ),
+                mock.call(
+                    Path("/tmp/bridge.sock"),
+                    "one",
+                    remote_open.Operation.OPEN,
+                    [str(second)],
+                    "application/pdf",
+                ),
+            ],
+        )
 
     def test_main_reports_bridge_operating_system_error(self):
         error = PermissionError("cannot bind socket")

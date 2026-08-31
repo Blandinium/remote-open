@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import socketserver
@@ -20,7 +21,7 @@ from typing import BinaryIO
 from urllib.parse import quote
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_MESSAGE_SIZE = 1024 * 1024
 SOCKET_TIMEOUT = 10.0
 HEADER = struct.Struct("!I")
@@ -33,6 +34,7 @@ class RemoteOpenError(Exception):
 class Operation(str, Enum):
     """An operation supported by the remote-open protocol."""
 
+    OPEN = "open"
     EDIT = "edit"
     DIFF = "diff"
 
@@ -80,26 +82,40 @@ def normalized_path(value: str) -> str:
     return path
 
 
-def validate_request(message: dict) -> tuple[Operation, str, list[str]]:
-    if set(message) != {"operation", "target", "paths"}:
-        raise RemoteOpenError("message must contain only operation, target, and paths")
+def validate_request(message: dict) -> tuple[Operation, str, list[str], str | None]:
+    if not isinstance(message, dict):
+        raise RemoteOpenError("message must be an object")
     try:
         operation = Operation(message["operation"])
-    except (TypeError, ValueError) as error:
-        raise RemoteOpenError("operation must be edit or diff") from error
+    except (KeyError, TypeError, ValueError) as error:
+        raise RemoteOpenError("operation must be open, edit, or diff") from error
+    expected_fields = {"operation", "target", "paths"}
+    if operation is Operation.OPEN:
+        expected_fields.add("mime_type")
+    if set(message) != expected_fields:
+        fields = ", ".join(sorted(expected_fields))
+        raise RemoteOpenError(f"message must contain only {fields}")
     target = message["target"]
     paths = message["paths"]
+    mime_type = message.get("mime_type")
     if not isinstance(target, str) or not target:
         raise RemoteOpenError("target must be a non-empty string")
     if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
         raise RemoteOpenError("paths must be a list of strings")
+    if operation is Operation.OPEN and len(paths) != 1:
+        raise RemoteOpenError("open needs one path")
+    if operation is Operation.OPEN and (
+        not isinstance(mime_type, str)
+        or not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", mime_type)
+    ):
+        raise RemoteOpenError("open needs a valid MIME type")
     if operation is Operation.EDIT and not paths:
         raise RemoteOpenError("edit needs at least one path")
     if operation is Operation.DIFF and len(paths) != 2:
         raise RemoteOpenError("diff needs two paths")
     if any(not path.startswith("/") for path in paths):
         raise RemoteOpenError("paths must be absolute")
-    return operation, target, paths
+    return operation, target, paths, mime_type
 
 
 def load_config(path: Path) -> dict:
@@ -126,13 +142,18 @@ def load_config(path: Path) -> dict:
         prefix = target["url_prefix"]
         if not isinstance(prefix, str) or not prefix.startswith(("sftp://", "ssh://")):
             raise RemoteOpenError(f"targets.{alias}.url_prefix must use sftp:// or ssh://")
-    if not isinstance(commands, dict) or set(commands) != {"edit", "diff"}:
-        raise RemoteOpenError("commands must contain edit and diff")
+    if not isinstance(commands, dict) or set(commands) != {"open", "edit", "diff"}:
+        raise RemoteOpenError("commands must contain open, edit, and diff")
     for operation, command in commands.items():
         if not isinstance(command, list) or not command:
             raise RemoteOpenError(f"commands.{operation} must be a non-empty list")
         if not all(isinstance(item, str) and item for item in command):
             raise RemoteOpenError(f"commands.{operation} has an invalid argument")
+    open_command = commands["open"]
+    if sum(item.count("{url}") for item in open_command) != 1:
+        raise RemoteOpenError("commands.open must contain {url} once")
+    if sum(item.count("{mime_type}") for item in open_command) > 1:
+        raise RemoteOpenError("commands.open may contain {mime_type} once")
     return config
 
 
@@ -145,13 +166,21 @@ def reap(process: subprocess.Popen) -> None:
 
 
 def launch(config_path: Path, message: dict) -> None:
-    operation, target, paths = validate_request(message)
+    operation, target, paths, mime_type = validate_request(message)
     config = load_config(config_path)
     try:
         prefix = config["targets"][target]["url_prefix"]
     except KeyError as error:
         raise RemoteOpenError(f"unknown target: {target}") from error
-    command = [*config["commands"][operation], *remote_urls(prefix, paths)]
+    urls = remote_urls(prefix, paths)
+    if operation is Operation.OPEN:
+        assert mime_type is not None
+        command = [
+            item.replace("{url}", urls[0]).replace("{mime_type}", mime_type)
+            for item in config["commands"][operation]
+        ]
+    else:
+        command = [*config["commands"][operation], *urls]
     try:
         process = subprocess.Popen(command, start_new_session=True)
     except OSError as error:
@@ -233,13 +262,40 @@ def bridge(socket_path: Path, config_path: Path) -> int:
     return 0
 
 
-def send_request(socket_path: Path, target: str, operation: Operation, values: list[str]) -> int:
+def detect_mime_type(path: str) -> str:
+    try:
+        result = subprocess.run(
+            ["file", "--brief", "--mime-type", "--", path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise RemoteOpenError(f"cannot determine MIME type: {error}") from error
+    mime_type = result.stdout.strip()
+    if result.returncode != 0 or not mime_type:
+        detail = result.stderr.strip() or f"file exited with status {result.returncode}"
+        raise RemoteOpenError(f"cannot determine MIME type for {path}: {detail}")
+    if not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", mime_type):
+        raise RemoteOpenError(f"file returned an invalid MIME type for {path}: {mime_type!r}")
+    return mime_type
+
+
+def send_request(
+    socket_path: Path,
+    target: str,
+    operation: Operation,
+    values: list[str],
+    mime_type: str | None = None,
+) -> int:
     paths = [normalized_path(value) for value in values]
-    if operation is Operation.DIFF:
+    if operation in (Operation.OPEN, Operation.DIFF):
         missing = [path for path in paths if not os.path.exists(path)]
         if missing:
-            raise RemoteOpenError(f"diff path does not exist: {missing[0]}")
+            raise RemoteOpenError(f"{operation.value} path does not exist: {missing[0]}")
     message = {"operation": operation, "target": target, "paths": paths}
+    if operation is Operation.OPEN:
+        message["mime_type"] = mime_type
     client = socket.socket(socket.AF_UNIX)
     client.settimeout(SOCKET_TIMEOUT)
     try:
@@ -262,6 +318,9 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="remote-open")
     result.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = result.add_subparsers(dest="operation", required=True)
+
+    open_parser = subparsers.add_parser(Operation.OPEN.value, help="open files in their default applications")
+    open_parser.add_argument("paths", nargs="+", metavar="PATH")
 
     edit = subparsers.add_parser(Operation.EDIT.value, help="open files in the configured editor")
     edit.add_argument("paths", nargs="+")
@@ -297,7 +356,15 @@ def main() -> int:
         target = os.environ.get("REMOTE_OPEN_TARGET")
         if not target:
             raise RemoteOpenError("REMOTE_OPEN_TARGET is not set")
-        return send_request(socket_path, target, Operation(arguments.operation), arguments.paths)
+        operation = Operation(arguments.operation)
+        if operation is Operation.OPEN:
+            for value in arguments.paths:
+                path = normalized_path(value)
+                if not os.path.exists(path):
+                    raise RemoteOpenError(f"open path does not exist: {path}")
+                send_request(socket_path, target, operation, [path], detect_mime_type(path))
+            return 0
+        return send_request(socket_path, target, operation, arguments.paths)
     except RemoteOpenError as error:
         print(f"remote-open: {error}", file=sys.stderr)
         return 1

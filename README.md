@@ -107,7 +107,7 @@ install -Dm644 examples/config.json ~/.config/remote-open/config.json
 
 Edit `~/.config/remote-open/config.json`. Add each remote machine as a target.
 
-For Kate and Kompare:
+For KDE with Kate and Kompare:
 
 ```json
 {
@@ -120,17 +120,24 @@ For Kate and Kompare:
     }
   },
   "commands": {
+    "open": ["kioclient", "exec"],
     "edit": ["kate"],
     "diff": ["kompare", "-c"]
   }
 }
 ```
 
-For GNOME Text Editor, change the edit command:
+For GNOME Text Editor, change the edit and open commands:
 
 ```json
+"open": ["gio", "open"],
 "edit": ["gnome-text-editor"]
 ```
+
+The `open` command chooses the application associated with the remote file's
+type. KDE's KIO integration can identify files at SFTP URLs and download a
+temporary copy when the selected application does not support remote URLs.
+Behavior outside KDE depends on the desktop and selected application.
 
 Start the bridge:
 
@@ -241,10 +248,14 @@ The supplied service uses that path without this variable.
 On the remote machine:
 
 ```sh
+remote-open open document.pdf
 remote-open edit file.txt
 remote-open edit one.txt two.txt
 remote-open diff old.txt new.txt
 ```
+
+`open` accepts one existing file and opens it in the default application for
+its type.
 
 `edit` accepts a missing file. It does not create it on the remote machine.
 The editor creates it on save. Its parent directory must exist.

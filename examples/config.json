@@ -5,6 +5,7 @@
     }
   },
   "commands": {
+    "open": ["kioclient", "exec", "{url}", "{mime_type}"],
     "edit": ["kate"],
     "diff": ["kompare", "-c"]
   }
