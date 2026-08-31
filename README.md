@@ -19,6 +19,7 @@ filesystem is mounted.
 ## Requirements
 
 - Python 3 on both machines.
+- The `file` command on remote machines.
 - OpenSSH with Unix socket forwarding.
 - An app that opens SFTP URLs.
 
@@ -120,24 +121,34 @@ For KDE with Kate and Kompare:
     }
   },
   "commands": {
-    "open": ["kioclient", "exec"],
+    "open": ["kioclient", "exec", "{url}", "{mime_type}"],
     "edit": ["kate"],
+    "edit_wait": ["kate", "--block"],
     "diff": ["kompare", "-c"]
   }
 }
 ```
 
-For GNOME Text Editor, change the edit and open commands:
+For GNOME Text Editor, change the open and edit commands and choose an editor
+that supports waiting for `edit_wait`:
 
 ```json
-"open": ["gio", "open"],
+"open": ["gio", "open", "{url}"],
 "edit": ["gnome-text-editor"]
 ```
 
-The `open` command chooses the application associated with the remote file's
-type. KDE's KIO integration can identify files at SFTP URLs and download a
-temporary copy when the selected application does not support remote URLs.
-Behavior outside KDE depends on the desktop and selected application.
+The remote `file` command determines the MIME type. The bridge substitutes
+`{url}` and `{mime_type}` in the configured open command. KDE's KIO integration
+can download a temporary copy when the selected application does not support
+remote URLs. Behavior outside KDE depends on the desktop and selected
+application.
+
+`edit_wait` must remain running until editing is finished. Kate provides this
+behavior with `--block`.
+
+Only the operations you want to use need command entries. If an operation is
+not configured, the bridge returns an error to the remote client without
+starting an application.
 
 Start the bridge:
 
@@ -249,16 +260,25 @@ On the remote machine:
 
 ```sh
 remote-open open document.pdf
+remote-open open photo.jpg song.flac
 remote-open edit file.txt
+remote-open edit --wait COMMIT_EDITMSG
 remote-open edit one.txt two.txt
 remote-open diff old.txt new.txt
 ```
 
-`open` accepts one existing file and opens it in the default application for
-its type.
+`open` accepts existing files and opens each one separately in its default
+application.
 
 `edit` accepts a missing file. It does not create it on the remote machine.
 The editor creates it on save. Its parent directory must exist.
+
+`edit --wait` blocks until the configured editor finishes. Other requests can
+continue through the bridge while it waits. To use it for Git commit messages:
+
+```sh
+git config --global core.editor 'remote-open edit --wait'
+```
 
 `diff` requires two existing paths. They may be files or directories.
 

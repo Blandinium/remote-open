@@ -24,31 +24,39 @@ loader.exec_module(remote_open)
 class ProtocolTests(unittest.TestCase):
     def test_message_round_trip(self):
         stream = io.BytesIO()
-        message = {"operation": "edit", "target": "one", "paths": ["/tmp/a b", "/tmp/é"]}
+        message = {"operation": "edit", "target": "one", "paths": ["/tmp/a b", "/tmp/é"], "wait": False}
         remote_open.write_message(stream, message)
         stream.seek(0)
         self.assertEqual(remote_open.read_message(stream), message)
 
     def test_request_operation_is_an_enum(self):
-        operation, _, _, _ = remote_open.validate_request(
-            {"operation": "edit", "target": "one", "paths": ["/tmp/file"]}
+        operation, _, _, _, _ = remote_open.validate_request(
+            {"operation": "edit", "target": "one", "paths": ["/tmp/file"], "wait": False}
         )
         self.assertIs(operation, remote_open.Operation.EDIT)
 
     def test_rejects_extra_fields(self):
         with self.assertRaises(remote_open.RemoteOpenError):
             remote_open.validate_request(
-                {"operation": "edit", "target": "one", "paths": ["/tmp/a"], "command": "sh"}
+                {"operation": "edit", "target": "one", "paths": ["/tmp/a"], "wait": False, "command": "sh"}
             )
 
     def test_diff_needs_two_paths(self):
         with self.assertRaises(remote_open.RemoteOpenError):
-            remote_open.validate_request({"operation": "diff", "target": "one", "paths": ["/tmp/a"]})
+            remote_open.validate_request(
+                {"operation": "diff", "target": "one", "paths": ["/tmp/a"], "wait": False}
+            )
 
     def test_open_needs_one_path(self):
         with self.assertRaises(remote_open.RemoteOpenError):
             remote_open.validate_request(
-                {"operation": "open", "target": "one", "paths": ["/tmp/a", "/tmp/b"]}
+                {
+                    "operation": "open",
+                    "target": "one",
+                    "paths": ["/tmp/a", "/tmp/b"],
+                    "mime_type": "text/plain",
+                    "wait": False,
+                }
             )
 
     def test_url_quotes_special_characters(self):
@@ -71,6 +79,7 @@ class ProtocolTests(unittest.TestCase):
             "commands": {
                 "open": ["kioclient", "exec", "{url}", "{mime_type}"],
                 "edit": ["kate"],
+                "edit_wait": ["kate", "--block"],
                 "diff": ["kompare", "-c"],
             },
         }
@@ -78,6 +87,38 @@ class ProtocolTests(unittest.TestCase):
             path = Path(directory) / "config.json"
             path.write_text(json.dumps(value), encoding="utf-8")
             self.assertEqual(remote_open.load_config(path), value)
+
+    def test_config_allows_omitting_commands(self):
+        value = {
+            "targets": {"one": {"url_prefix": "sftp://user@host"}},
+            "commands": {"edit": ["kate"]},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            self.assertEqual(remote_open.load_config(path), value)
+
+    def test_unconfigured_operation_is_rejected(self):
+        value = {
+            "targets": {"one": {"url_prefix": "sftp://user@host"}},
+            "commands": {"edit": ["kate"]},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(
+                remote_open.RemoteOpenError,
+                "diff is not configured on the bridge",
+            ):
+                remote_open.launch(
+                    path,
+                    {
+                        "operation": "diff",
+                        "target": "one",
+                        "paths": ["/tmp/old", "/tmp/new"],
+                        "wait": False,
+                    },
+                )
 
     def test_target_selects_url_prefix(self):
         value = {
@@ -88,6 +129,7 @@ class ProtocolTests(unittest.TestCase):
             "commands": {
                 "open": ["kioclient", "exec", "{url}", "{mime_type}"],
                 "edit": ["kate"],
+                "edit_wait": ["kate", "--block"],
                 "diff": ["kompare", "-c"],
             },
         }
@@ -98,7 +140,7 @@ class ProtocolTests(unittest.TestCase):
                 popen.return_value.wait.return_value = 0
                 remote_open.launch(
                     path,
-                    {"operation": "edit", "target": "two", "paths": ["/tmp/a b"]},
+                    {"operation": "edit", "target": "two", "paths": ["/tmp/a b"], "wait": False},
                 )
             popen.assert_called_once_with(
                 ["kate", "sftp://user@two/tmp/a%20b"],
@@ -111,6 +153,7 @@ class ProtocolTests(unittest.TestCase):
             "commands": {
                 "open": ["kioclient", "exec", "{url}", "{mime_type}"],
                 "edit": ["kate"],
+                "edit_wait": ["kate", "--block"],
                 "diff": ["kompare"],
             },
         }
@@ -126,12 +169,43 @@ class ProtocolTests(unittest.TestCase):
                         "target": "one",
                         "paths": ["/tmp/a b.pdf"],
                         "mime_type": "application/pdf",
+                        "wait": False,
                     },
                 )
             popen.assert_called_once_with(
                 ["kioclient", "exec", "sftp://user@host/tmp/a%20b.pdf", "application/pdf"],
                 start_new_session=True,
             )
+
+    def test_waiting_edit_uses_blocking_command(self):
+        value = {
+            "targets": {"one": {"url_prefix": "sftp://user@host"}},
+            "commands": {
+                "open": ["kioclient", "exec", "{url}"],
+                "edit": ["kate"],
+                "edit_wait": ["kate", "--block"],
+                "diff": ["kompare"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with mock.patch.object(remote_open.subprocess, "Popen") as popen:
+                popen.return_value.wait.return_value = 0
+                remote_open.launch(
+                    path,
+                    {
+                        "operation": "edit",
+                        "target": "one",
+                        "paths": ["/tmp/COMMIT_EDITMSG"],
+                        "wait": True,
+                    },
+                )
+            popen.assert_called_once_with(
+                ["kate", "--block", "sftp://user@host/tmp/COMMIT_EDITMSG"],
+                start_new_session=True,
+            )
+            popen.return_value.wait.assert_called_once_with()
 
     def test_detects_mime_type_with_file(self):
         result = subprocess.CompletedProcess([], 0, "image/png\n", "")
@@ -156,6 +230,7 @@ class ProtocolTests(unittest.TestCase):
                         "commands": {
                             "open": ["/bin/true", "{url}"],
                             "edit": ["/bin/true"],
+                            "edit_wait": ["/bin/true"],
                             "diff": ["/bin/true"],
                         },
                     }
@@ -227,6 +302,7 @@ class ProtocolTests(unittest.TestCase):
                         "commands": {
                             "open": ["/bin/true", "{url}"],
                             "edit": ["/bin/true"],
+                            "edit_wait": ["/bin/true"],
                             "diff": ["/bin/true"],
                         },
                     }
@@ -236,7 +312,12 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(remote_open.RemoteOpenError, "unknown target"):
                 remote_open.launch(
                     path,
-                    {"operation": "edit", "target": "unknown", "paths": ["/tmp/file"]},
+                    {
+                        "operation": "edit",
+                        "target": "unknown",
+                        "paths": ["/tmp/file"],
+                        "wait": False,
+                    },
                 )
 
     def test_client_socket_has_timeout(self):

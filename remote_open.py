@@ -21,7 +21,7 @@ from typing import BinaryIO
 from urllib.parse import quote
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MAX_MESSAGE_SIZE = 1024 * 1024
 SOCKET_TIMEOUT = 10.0
 HEADER = struct.Struct("!I")
@@ -82,14 +82,14 @@ def normalized_path(value: str) -> str:
     return path
 
 
-def validate_request(message: dict) -> tuple[Operation, str, list[str], str | None]:
+def validate_request(message: dict) -> tuple[Operation, str, list[str], str | None, bool]:
     if not isinstance(message, dict):
         raise RemoteOpenError("message must be an object")
     try:
         operation = Operation(message["operation"])
     except (KeyError, TypeError, ValueError) as error:
         raise RemoteOpenError("operation must be open, edit, or diff") from error
-    expected_fields = {"operation", "target", "paths"}
+    expected_fields = {"operation", "target", "paths", "wait"}
     if operation is Operation.OPEN:
         expected_fields.add("mime_type")
     if set(message) != expected_fields:
@@ -98,6 +98,11 @@ def validate_request(message: dict) -> tuple[Operation, str, list[str], str | No
     target = message["target"]
     paths = message["paths"]
     mime_type = message.get("mime_type")
+    wait = message["wait"]
+    if not isinstance(wait, bool):
+        raise RemoteOpenError("wait must be a boolean")
+    if wait and operation is not Operation.EDIT:
+        raise RemoteOpenError("wait is supported only for edit")
     if not isinstance(target, str) or not target:
         raise RemoteOpenError("target must be a non-empty string")
     if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
@@ -115,7 +120,7 @@ def validate_request(message: dict) -> tuple[Operation, str, list[str], str | No
         raise RemoteOpenError("diff needs two paths")
     if any(not path.startswith("/") for path in paths):
         raise RemoteOpenError("paths must be absolute")
-    return operation, target, paths, mime_type
+    return operation, target, paths, mime_type, wait
 
 
 def load_config(path: Path) -> dict:
@@ -142,18 +147,22 @@ def load_config(path: Path) -> dict:
         prefix = target["url_prefix"]
         if not isinstance(prefix, str) or not prefix.startswith(("sftp://", "ssh://")):
             raise RemoteOpenError(f"targets.{alias}.url_prefix must use sftp:// or ssh://")
-    if not isinstance(commands, dict) or set(commands) != {"open", "edit", "diff"}:
-        raise RemoteOpenError("commands must contain open, edit, and diff")
+    command_names = {"open", "edit", "edit_wait", "diff"}
+    if not isinstance(commands, dict) or not commands:
+        raise RemoteOpenError("commands must be a non-empty object")
+    if not set(commands).issubset(command_names):
+        raise RemoteOpenError("commands may contain only open, edit, edit_wait, and diff")
     for operation, command in commands.items():
         if not isinstance(command, list) or not command:
             raise RemoteOpenError(f"commands.{operation} must be a non-empty list")
         if not all(isinstance(item, str) and item for item in command):
             raise RemoteOpenError(f"commands.{operation} has an invalid argument")
-    open_command = commands["open"]
-    if sum(item.count("{url}") for item in open_command) != 1:
-        raise RemoteOpenError("commands.open must contain {url} once")
-    if sum(item.count("{mime_type}") for item in open_command) > 1:
-        raise RemoteOpenError("commands.open may contain {mime_type} once")
+    if "open" in commands:
+        open_command = commands["open"]
+        if sum(item.count("{url}") for item in open_command) != 1:
+            raise RemoteOpenError("commands.open must contain {url} once")
+        if sum(item.count("{mime_type}") for item in open_command) > 1:
+            raise RemoteOpenError("commands.open may contain {mime_type} once")
     return config
 
 
@@ -166,26 +175,35 @@ def reap(process: subprocess.Popen) -> None:
 
 
 def launch(config_path: Path, message: dict) -> None:
-    operation, target, paths, mime_type = validate_request(message)
+    operation, target, paths, mime_type, wait = validate_request(message)
     config = load_config(config_path)
     try:
         prefix = config["targets"][target]["url_prefix"]
     except KeyError as error:
         raise RemoteOpenError(f"unknown target: {target}") from error
     urls = remote_urls(prefix, paths)
+    command_name = "edit_wait" if wait else operation.value
+    if command_name not in config["commands"]:
+        display_name = "edit --wait" if wait else operation.value
+        raise RemoteOpenError(f"{display_name} is not configured on the bridge")
     if operation is Operation.OPEN:
         assert mime_type is not None
         command = [
             item.replace("{url}", urls[0]).replace("{mime_type}", mime_type)
-            for item in config["commands"][operation]
+            for item in config["commands"][command_name]
         ]
     else:
-        command = [*config["commands"][operation], *urls]
+        command = [*config["commands"][command_name], *urls]
     try:
         process = subprocess.Popen(command, start_new_session=True)
     except OSError as error:
         raise RemoteOpenError(f"cannot start {command[0]}: {error}") from error
-    threading.Thread(target=reap, args=(process,), daemon=True).start()
+    if wait:
+        status = process.wait()
+        if status != 0:
+            raise RemoteOpenError(f"{command[0]} exited with status {status}")
+    else:
+        threading.Thread(target=reap, args=(process,), daemon=True).start()
 
 
 class RequestHandler(socketserver.StreamRequestHandler):
@@ -287,13 +305,14 @@ def send_request(
     operation: Operation,
     values: list[str],
     mime_type: str | None = None,
+    wait: bool = False,
 ) -> int:
     paths = [normalized_path(value) for value in values]
     if operation in (Operation.OPEN, Operation.DIFF):
         missing = [path for path in paths if not os.path.exists(path)]
         if missing:
             raise RemoteOpenError(f"{operation.value} path does not exist: {missing[0]}")
-    message = {"operation": operation, "target": target, "paths": paths}
+    message = {"operation": operation, "target": target, "paths": paths, "wait": wait}
     if operation is Operation.OPEN:
         message["mime_type"] = mime_type
     client = socket.socket(socket.AF_UNIX)
@@ -302,6 +321,8 @@ def send_request(
         client.connect(str(socket_path))
         stream = client.makefile("rwb")
         write_message(stream, message)
+        if wait:
+            client.settimeout(None)
         response = read_message(stream)
     except socket.timeout as error:
         raise RemoteOpenError(f"socket operation timed out: {socket_path}") from error
@@ -323,6 +344,7 @@ def parser() -> argparse.ArgumentParser:
     open_parser.add_argument("paths", nargs="+", metavar="PATH")
 
     edit = subparsers.add_parser(Operation.EDIT.value, help="open files in the configured editor")
+    edit.add_argument("--wait", action="store_true", help="wait until the editor finishes")
     edit.add_argument("paths", nargs="+")
 
     diff = subparsers.add_parser(Operation.DIFF.value, help="compare two existing paths")
@@ -364,7 +386,13 @@ def main() -> int:
                     raise RemoteOpenError(f"open path does not exist: {path}")
                 send_request(socket_path, target, operation, [path], detect_mime_type(path))
             return 0
-        return send_request(socket_path, target, operation, arguments.paths)
+        return send_request(
+            socket_path,
+            target,
+            operation,
+            arguments.paths,
+            wait=getattr(arguments, "wait", False),
+        )
     except RemoteOpenError as error:
         print(f"remote-open: {error}", file=sys.stderr)
         return 1
