@@ -3,13 +3,11 @@
 Open remote files from an SSH session in an editor on your workstation.
 
 `remote-open` follows the model of `EMACSCLIENT_TRAMP` for Emacs. It works with
-any editor that can open remote files. It sends paths through a forwarded Unix
-socket. The workstation turns them into SFTP URLs.
-
-Editors commonly keep a local working copy and need the network only when they
-open or save a file, so editing may continue through network failures. The
-exact behavior depends on the editor and its remote-file integration. No remote
+any application that can open remote files. It sends paths through a forwarded Unix
+socket. The workstation turns them into SFTP URLs. No remote
 filesystem is mounted.
+
+More background in [this blog post](https://tijl.blog/posts/remote-open/)
 
 ## Terms
 
@@ -23,8 +21,7 @@ filesystem is mounted.
 - OpenSSH with Unix socket forwarding.
 - An app that opens SFTP URLs.
 
-Kate and Kompare work. GNOME Text Editor should work through GIO. Meld does not
-document remote URL support. It is not supported.
+Kate and Kompare work. GNOME Text Editor should work through GIO.
 
 ## Try it without a service
 
@@ -129,19 +126,10 @@ For KDE with Kate and Kompare:
 }
 ```
 
-For GNOME Text Editor, change the open and edit commands and choose an editor
-that supports waiting for `edit_wait`:
-
-```json
-"open": ["gio", "open", "{url}"],
-"edit": ["gnome-text-editor"]
-```
-
 The remote `file` command determines the MIME type. The bridge substitutes
 `{url}` and `{mime_type}` in the configured open command. KDE's KIO integration
 can download a temporary copy when the selected application does not support
-remote URLs. Behavior outside KDE depends on the desktop and selected
-application.
+remote URLs.
 
 `edit_wait` must remain running until editing is finished. Kate provides this
 behavior with `--block`.
@@ -155,13 +143,6 @@ Start the bridge:
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now remote-open.service
-```
-
-If the app does not open, import the desktop environment and restart:
-
-```sh
-systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY
-systemctl --user restart remote-open.service
 ```
 
 ## SSH forwarding
