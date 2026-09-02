@@ -157,34 +157,34 @@ Host REMOTE_ALIAS
     ControlPath ~/.ssh/control-%C
     ControlPersist 10m
     RemoteForward /home/REMOTE_USER/.remote-open.socket /run/user/WORKSTATION_UID/remote-open.sock
-    StreamLocalBindMask 0177
-    StreamLocalBindUnlink yes
     ExitOnForwardFailure yes
 ```
+
+Because this is a remote forward, `sshd` creates the listening socket on the
+remote machine.  Configure these options in `/etc/ssh/sshd_config` on every
+remote machine:
+
+```sshconfig
+StreamLocalBindMask 0177
+StreamLocalBindUnlink yes
+```
+
+Validate the configuration and reload `sshd`; the exact service name varies by
+distribution:
+
+```sh
+sudo sshd -t
+sudo systemctl reload sshd
+sudo sshd -T | grep '^streamlocalbind'
+```
+
+The last command must report both `streamlocalbindmask 0177` and
+`streamlocalbindunlink yes`.
 
 Connect with the exact alias:
 
 ```sh
 ssh REMOTE_ALIAS
-```
-
-The master connection owns the forwarding socket. Other sessions reuse it.
-This avoids a socket clash between sessions.
-
-Each remote machine has its own forwarded socket. All of them connect to the
-same workstation bridge. Only one bridge service runs.
-
-Check the master:
-
-```sh
-ssh -O check REMOTE_ALIAS
-```
-
-If no master runs and a stale remote socket remains, remove it on the remote
-machine:
-
-```sh
-rm -f ~/.remote-open.socket
 ```
 
 ## Shell setup
