@@ -121,7 +121,8 @@ For KDE with Kate and Kompare:
     "open": ["kioclient", "exec", "{url}", "{mime_type}"],
     "edit": ["kate"],
     "edit_wait": ["kate", "--block"],
-    "diff": ["kompare", "-c"]
+    "diff": ["kompare", "-c"],
+    "diff_wait": ["kompare", "-c"]
   }
 }
 ```
@@ -131,8 +132,8 @@ The remote `file` command determines the MIME type. The bridge substitutes
 can download a temporary copy when the selected application does not support
 remote URLs.
 
-`edit_wait` must remain running until editing is finished. Kate provides this
-behavior with `--block`.
+`edit_wait` and `diff_wait` must remain running until their application is
+finished. Kate provides this behavior with `--block`.
 
 Only the operations you want to use need command entries. If an operation is
 not configured, the bridge returns an error to the remote client without
@@ -246,6 +247,7 @@ remote-open edit file.txt
 remote-open edit --wait COMMIT_EDITMSG
 remote-open edit one.txt two.txt
 remote-open diff old.txt new.txt
+remote-open diff --wait old.txt new.txt
 ```
 
 `open` accepts existing files and opens each one separately in its default
@@ -262,6 +264,12 @@ git config --global core.editor 'remote-open edit --wait'
 ```
 
 `diff` requires two existing paths. They may be files or directories.
+`diff --wait` blocks until the configured diff tool finishes. This keeps Git's
+temporary files available when using remote-open as an external diff command:
+
+```sh
+git config --global diff.external 'remote-open diff --wait'
+```
 
 Paths are made absolute before they are sent. Spaces, Unicode, and newlines are
 safe. The protocol sends an operation, a target alias, and paths. The

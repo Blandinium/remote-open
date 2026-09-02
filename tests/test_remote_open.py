@@ -47,6 +47,86 @@ class ProtocolTests(unittest.TestCase):
                 {"operation": "diff", "target": "one", "paths": ["/tmp/a"], "wait": False}
             )
 
+    def test_diff_parser_accepts_git_external_diff_arguments(self):
+        values = ["file.txt", "/tmp/old", "abc", "100644", "/tmp/new", "def", "100644"]
+        arguments = remote_open.parser().parse_args(["diff", "--wait", *values])
+        self.assertEqual(arguments.paths, values)
+        self.assertTrue(arguments.wait)
+
+    def test_diff_rejects_other_argument_counts(self):
+        with self.assertRaisesRegex(remote_open.RemoteOpenError, "Git's seven arguments"):
+            remote_open.send_request(
+                Path("/tmp/bridge.sock"),
+                "one",
+                remote_open.Operation.DIFF,
+                ["one", "two", "three"],
+            )
+
+    def test_git_external_diff_uses_old_and_new_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = Path(directory) / "old"
+            new = Path(directory) / "new"
+            old.touch()
+            new.touch()
+            values = ["file.txt", str(old), "abc", "100644", str(new), "def", "100644"]
+            client = mock.MagicMock()
+            client.makefile.return_value = io.BytesIO()
+            with mock.patch.object(remote_open.socket, "socket", return_value=client):
+                with mock.patch.object(remote_open, "write_message") as write:
+                    with mock.patch.object(remote_open, "read_message", return_value={"ok": True}):
+                        remote_open.send_request(
+                            Path("/tmp/bridge.sock"), "one", remote_open.Operation.DIFF, values
+                        )
+        write.assert_called_once_with(
+            client.makefile.return_value,
+            {
+                "operation": remote_open.Operation.DIFF,
+                "target": "one",
+                "paths": [str(old), str(new)],
+                "wait": False,
+            },
+        )
+
+    def test_git_external_diff_wait_sends_wait_and_disables_socket_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = Path(directory) / "old"
+            new = Path(directory) / "new"
+            old.touch()
+            new.touch()
+            values = ["file.txt", str(old), "abc", "100644", str(new), "def", "100644"]
+            arguments = mock.Mock(operation="diff", paths=values, wait=True)
+            client = mock.MagicMock()
+            client.makefile.return_value = io.BytesIO()
+            with mock.patch.object(remote_open, "parser") as parser:
+                parser.return_value.parse_args.return_value = arguments
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "REMOTE_OPEN_SOCKET": "/tmp/bridge.sock",
+                        "REMOTE_OPEN_TARGET": "one",
+                    },
+                ):
+                    with mock.patch.object(remote_open.socket, "socket", return_value=client):
+                        with mock.patch.object(remote_open, "write_message") as write:
+                            with mock.patch.object(
+                                remote_open, "read_message", return_value={"ok": True}
+                            ):
+                                self.assertEqual(remote_open.main(), 0)
+
+        write.assert_called_once_with(
+            client.makefile.return_value,
+            {
+                "operation": remote_open.Operation.DIFF,
+                "target": "one",
+                "paths": [str(old), str(new)],
+                "wait": True,
+            },
+        )
+        self.assertEqual(
+            client.settimeout.call_args_list,
+            [mock.call(remote_open.SOCKET_TIMEOUT), mock.call(None)],
+        )
+
     def test_open_needs_one_path(self):
         with self.assertRaises(remote_open.RemoteOpenError):
             remote_open.validate_request(
@@ -81,6 +161,7 @@ class ProtocolTests(unittest.TestCase):
                 "edit": ["kate"],
                 "edit_wait": ["kate", "--block"],
                 "diff": ["kompare", "-c"],
+                "diff_wait": ["kompare", "-c"],
             },
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +284,61 @@ class ProtocolTests(unittest.TestCase):
                 )
             popen.assert_called_once_with(
                 ["kate", "--block", "sftp://user@host/tmp/COMMIT_EDITMSG"],
+                start_new_session=True,
+            )
+            popen.return_value.wait.assert_called_once_with()
+
+    def test_waiting_diff_uses_blocking_command(self):
+        value = {
+            "targets": {"one": {"url_prefix": "sftp://user@host"}},
+            "commands": {"diff_wait": ["kompare", "-c"]},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with mock.patch.object(remote_open.subprocess, "Popen") as popen:
+                popen.return_value.wait.return_value = 0
+                remote_open.launch(
+                    path,
+                    {
+                        "operation": "diff",
+                        "target": "one",
+                        "paths": ["/tmp/old", "/tmp/new"],
+                        "wait": True,
+                    },
+                )
+            popen.assert_called_once_with(
+                ["kompare", "-c", "sftp://user@host/tmp/old", "sftp://user@host/tmp/new"],
+                start_new_session=True,
+            )
+            popen.return_value.wait.assert_called_once_with()
+
+    def test_waiting_diff_reports_nonzero_exit_status(self):
+        value = {
+            "targets": {"one": {"url_prefix": "sftp://user@host"}},
+            "commands": {"diff_wait": ["kompare", "-c"]},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with mock.patch.object(remote_open.subprocess, "Popen") as popen:
+                popen.return_value.wait.return_value = 2
+                with self.assertRaisesRegex(
+                    remote_open.RemoteOpenError,
+                    "kompare exited with status 2",
+                ):
+                    remote_open.launch(
+                        path,
+                        {
+                            "operation": "diff",
+                            "target": "one",
+                            "paths": ["/tmp/old", "/tmp/new"],
+                            "wait": True,
+                        },
+                    )
+
+            popen.assert_called_once_with(
+                ["kompare", "-c", "sftp://user@host/tmp/old", "sftp://user@host/tmp/new"],
                 start_new_session=True,
             )
             popen.return_value.wait.assert_called_once_with()

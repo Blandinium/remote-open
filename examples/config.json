@@ -8,6 +8,7 @@
     "open": ["kioclient", "exec", "{url}", "{mime_type}"],
     "edit": ["kate"],
     "edit_wait": ["kate", "--block"],
-    "diff": ["kompare", "-c"]
+    "diff": ["kompare", "-c"],
+    "diff_wait": ["kompare", "-c"]
   }
 }

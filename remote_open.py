@@ -101,8 +101,8 @@ def validate_request(message: dict) -> tuple[Operation, str, list[str], str | No
     wait = message["wait"]
     if not isinstance(wait, bool):
         raise RemoteOpenError("wait must be a boolean")
-    if wait and operation is not Operation.EDIT:
-        raise RemoteOpenError("wait is supported only for edit")
+    if wait and operation not in (Operation.EDIT, Operation.DIFF):
+        raise RemoteOpenError("wait is supported only for edit and diff")
     if not isinstance(target, str) or not target:
         raise RemoteOpenError("target must be a non-empty string")
     if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
@@ -147,11 +147,11 @@ def load_config(path: Path) -> dict:
         prefix = target["url_prefix"]
         if not isinstance(prefix, str) or not prefix.startswith(("sftp://", "ssh://")):
             raise RemoteOpenError(f"targets.{alias}.url_prefix must use sftp:// or ssh://")
-    command_names = {"open", "edit", "edit_wait", "diff"}
+    command_names = {"open", "edit", "edit_wait", "diff", "diff_wait"}
     if not isinstance(commands, dict) or not commands:
         raise RemoteOpenError("commands must be a non-empty object")
     if not set(commands).issubset(command_names):
-        raise RemoteOpenError("commands may contain only open, edit, edit_wait, and diff")
+        raise RemoteOpenError("commands may contain only open, edit, edit_wait, diff, and diff_wait")
     for operation, command in commands.items():
         if not isinstance(command, list) or not command:
             raise RemoteOpenError(f"commands.{operation} must be a non-empty list")
@@ -182,9 +182,9 @@ def launch(config_path: Path, message: dict) -> None:
     except KeyError as error:
         raise RemoteOpenError(f"unknown target: {target}") from error
     urls = remote_urls(prefix, paths)
-    command_name = "edit_wait" if wait else operation.value
+    command_name = f"{operation.value}_wait" if wait else operation.value
     if command_name not in config["commands"]:
-        display_name = "edit --wait" if wait else operation.value
+        display_name = f"{operation.value} --wait" if wait else operation.value
         raise RemoteOpenError(f"{display_name} is not configured on the bridge")
     if operation is Operation.OPEN:
         assert mime_type is not None
@@ -307,7 +307,14 @@ def send_request(
     mime_type: str | None = None,
     wait: bool = False,
 ) -> int:
-    paths = [normalized_path(value) for value in values]
+    if operation is Operation.DIFF and len(values) == 7:
+        # Git external diffs receive:
+        # path old-file old-hex old-mode new-file new-hex new-mode
+        paths = [normalized_path(values[1]), normalized_path(values[4])]
+    elif operation is Operation.DIFF and len(values) != 2:
+        raise RemoteOpenError("diff needs two paths or Git's seven arguments")
+    else:
+        paths = [normalized_path(value) for value in values]
     if operation in (Operation.OPEN, Operation.DIFF):
         missing = [path for path in paths if not os.path.exists(path)]
         if missing:
@@ -348,7 +355,8 @@ def parser() -> argparse.ArgumentParser:
     edit.add_argument("paths", nargs="+")
 
     diff = subparsers.add_parser(Operation.DIFF.value, help="compare two existing paths")
-    diff.add_argument("paths", nargs=2, metavar=("LEFT", "RIGHT"))
+    diff.add_argument("--wait", action="store_true", help="wait until the diff tool finishes")
+    diff.add_argument("paths", nargs="+", metavar="PATH")
 
     bridge_parser = subparsers.add_parser("bridge", help="run the workstation bridge")
     bridge_parser.add_argument(
