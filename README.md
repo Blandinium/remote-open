@@ -1,6 +1,6 @@
 # remote-open
 
-Open remote files from an SSH session in an editor on your workstation.
+Open remote files from an SSH session in an editor on your local desktop.
 
 `remote-open` follows the model of `EMACSCLIENT_TRAMP` for Emacs. It works with
 any application that can open remote files. It sends paths through a forwarded Unix
@@ -11,7 +11,7 @@ More background in [this blog post](https://tijl.blog/posts/remote-open/)
 
 ## Terms
 
-- **Workstation:** the machine with the desktop app.
+- **Workstation:** the local machine with the desktop app.
 - **Remote machine:** the machine with the files and SSH shell.
 
 ## Requirements
